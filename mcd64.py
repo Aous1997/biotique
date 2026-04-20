@@ -6,7 +6,6 @@
 =============================================================
 Lancement :
     pip install paramiko geopandas shapely pandas tqdm requests
-
     python mcd64_guyane.py
 
 Configuration :
@@ -14,9 +13,25 @@ Configuration :
     Modifier MONTHS pour filtrer certains mois (None = tous)
 
 Sorties dans ./outputs/mcd64/ :
-    mcd64_guyane_YYYY_MM.shp  (fichiers mensuels découpés)
-    mcd64_guyane_complet.gpkg (fusion toutes années/mois)
-    mcd64_guyane_complet.geojson
+    mcd64_guyane_YYYY_MM.shp     (fichiers mensuels decoupes en EPSG:4326)
+    mcd64_guyane_complet.gpkg    (fusion EPSG:4326, pour QGIS)
+    mcd64_guyane_complet.geojson (pour dashboards web)
+    mcd64_guyane_postgis.gpkg    (EPSG:2972, MultiPolygon, pret pour ogr2ogr)
+    import_postgis.bat           (Windows : lance ogr2ogr)
+    import_postgis.sh            (Linux/Mac)
+    mcd64_guyane_resume_annuel.csv
+
+Table cible :
+    CREATE TABLE biotique.mcd64_guyane_complet (
+        id serial4 NOT NULL,
+        geom public.geometry(multipolygon, 2972) NULL,
+        "BurnDate" int2 NULL,
+        "year" int2 NULL,
+        "month" int2 NULL,
+        "period" varchar NULL,
+        area_ha numeric NULL,
+        CONSTRAINT mcd64_guyane_complet_pkey PRIMARY KEY (id)
+    );
 =============================================================
 """
 
@@ -27,6 +42,7 @@ import pandas as pd
 import geopandas as gpd
 from pathlib import Path
 from tqdm import tqdm
+from shapely.geometry import MultiPolygon, Polygon
 
 # ─────────────────────────────────────────────
 # CONFIGURATION — À MODIFIER
@@ -54,6 +70,11 @@ CONTOUR_URL = (
     "/master/regions/guyane/departements-guyane.geojson"
 )
 
+# Schéma et table cibles pour la sortie SQL
+SQL_SCHEMA = "biotique"
+SQL_TABLE  = "mcd64_guyane_complet"
+SQL_SRID   = 2972   # CRS de la colonne geom
+
 # Dossiers
 DATA_DIR = Path("./data/mcd64_raw")     # fichiers bruts téléchargés
 EXTRACT_DIR = Path("./data/mcd64_shp") # shapefiles extraits
@@ -65,10 +86,8 @@ for d in [DATA_DIR, EXTRACT_DIR, OUT_DIR]:
 # UTILITAIRES
 # ─────────────────────────────────────────────
 
-# Correspondance DOY → mois (pour nommage fichiers)
-# MCD64monthly.AYYYYDDD → DOY 1=jan, 32=fev, 60=mar ...
 DOY_TO_MONTH = {
-    1:1, 32:2, 60:3, 61:3,    # mars selon année bissextile
+    1:1, 32:2, 60:3, 61:3,
     91:4, 92:4, 121:5, 122:5,
     152:6, 153:6, 182:7, 183:7,
     213:8, 214:8, 244:9, 245:9,
@@ -77,33 +96,31 @@ DOY_TO_MONTH = {
 }
 
 def doy_to_month(doy):
-    """Retourne le mois à partir du DOY du nom de fichier MCD64."""
     return DOY_TO_MONTH.get(int(doy), None)
 
 def parse_filename(fname):
-    """
-    Extrait année et mois depuis :
-    MCD64monthly.A2016213.Win05.006.burndate.shapefiles.tar.gz
-    → year=2016, month=8
-    """
     try:
         parts = fname.split(".")
-        date_part = parts[1]          # A2016213
-        year = int(date_part[1:5])    # 2016
-        doy  = int(date_part[5:])     # 213
+        date_part = parts[1]
+        year = int(date_part[1:5])
+        doy  = int(date_part[5:])
         month = doy_to_month(doy)
         return year, month
     except Exception:
         return None, None
 
+def force_multipolygon(geom):
+    """Convertit un Polygon en MultiPolygon. Retourne None si geometrie invalide."""
+    if geom is None or geom.is_empty:
+        return None
+    if isinstance(geom, Polygon):
+        return MultiPolygon([geom])
+    return geom
+
 # ─────────────────────────────────────────────
 # 1. CONTOUR GUYANE
 # ─────────────────────────────────────────────
 def get_contour_guyane():
-    """
-    Télécharge le contour de la Guyane française depuis france-geojson (IGN).
-    Retourne un GeoDataFrame en EPSG:4326.
-    """
     local = DATA_DIR / "contour_guyane.geojson"
     if not local.exists():
         print("  Téléchargement contour Guyane (IGN/france-geojson)...")
@@ -121,10 +138,6 @@ def get_contour_guyane():
 # 2. CONNEXION SFTP
 # ─────────────────────────────────────────────
 def connect_sftp():
-    """
-    Ouvre une connexion SFTP vers fuoco.geog.umd.edu.
-    Retourne (transport, sftp_client).
-    """
     print(f"  Connexion SFTP → {SFTP_HOST}...")
     transport = paramiko.Transport((SFTP_HOST, 22))
     transport.connect(username=SFTP_USER, password=SFTP_PASS)
@@ -136,12 +149,7 @@ def connect_sftp():
 # 3. LISTE DES FICHIERS DISPONIBLES
 # ─────────────────────────────────────────────
 def list_remote_files(sftp, years, months_filter):
-    """
-    Parcourt les dossiers SFTP et retourne la liste des fichiers
-    .tar.gz à télécharger selon la plage années/mois.
-    """
     to_download = []
-
     for year in years:
         remote_dir = f"{SFTP_BASE}/{year}"
         try:
@@ -166,7 +174,6 @@ def list_remote_files(sftp, years, months_filter):
                 "month": mo,
                 "fname": fname,
             })
-
     print(f"  {len(to_download)} fichiers à télécharger")
     return to_download
 
@@ -174,81 +181,57 @@ def list_remote_files(sftp, years, months_filter):
 # 4. TÉLÉCHARGEMENT
 # ─────────────────────────────────────────────
 def download_files(sftp, file_list):
-    """Télécharge les fichiers .tar.gz depuis le serveur SFTP."""
     downloaded = []
     for item in tqdm(file_list, desc="Téléchargement"):
         local = item["local_path"]
-
-        # Déjà téléchargé ?
         if local.exists() and local.stat().st_size > 1000:
             downloaded.append(item)
             continue
-
         try:
-            # Récupérer la taille pour la barre de progression
             attr = sftp.stat(item["remote_path"])
             size = attr.st_size
-
             with tqdm(total=size, unit="B", unit_scale=True,
                       desc=f"  {item['fname'][:40]}", leave=False) as bar:
                 def callback(transferred, total, b=bar):
                     b.update(transferred - b.n)
                 sftp.get(item["remote_path"], str(local), callback=callback)
-
             downloaded.append(item)
             time.sleep(0.2)
-
         except Exception as e:
             print(f"  Erreur {item['fname']} : {e}")
-
     return downloaded
 
 # ─────────────────────────────────────────────
 # 5. EXTRACTION .tar.gz → .shp
 # ─────────────────────────────────────────────
 def extract_shapefiles(file_list):
-    """
-    Extrait les .tar.gz et retourne la liste des .shp extraits.
-    Chaque archive contient : .shp .shx .dbf .prj
-    """
     shp_files = []
-
     for item in tqdm(file_list, desc="Extraction"):
         tar_path = item["local_path"]
         year     = item["year"]
         month    = item["month"]
-
-        # Dossier de destination
         out_subdir = EXTRACT_DIR / f"{year}_{month:02d}"
         shp_target = out_subdir / f"mcd64_{year}_{month:02d}.shp"
 
         if shp_target.exists():
             shp_files.append({**item, "shp_path": shp_target})
             continue
-
         out_subdir.mkdir(exist_ok=True)
 
         try:
             with tarfile.open(tar_path, "r:gz") as tar:
-                members = tar.getmembers()
-
-                # Extraire tous les composants du shapefile
-                for member in members:
+                for member in tar.getmembers():
                     ext = Path(member.name).suffix.lower()
                     if ext in [".shp",".shx",".dbf",".prj",".cpg"]:
                         member.name = Path(member.name).name
                         tar.extract(member, path=out_subdir)
-
-                # Renommer le .shp principal
                 shp_found = list(out_subdir.glob("*.shp"))
                 if shp_found:
                     src = shp_found[0]
-                    # Renommer tous les composants
                     for f in out_subdir.glob(src.stem + ".*"):
                         new_name = out_subdir / f"mcd64_{year}_{month:02d}{f.suffix}"
                         f.rename(new_name)
                     shp_files.append({**item, "shp_path": shp_target})
-
         except Exception as e:
             print(f"  Erreur extraction {tar_path.name} : {e}")
 
@@ -259,21 +242,12 @@ def extract_shapefiles(file_list):
 # 6. CLIP SUR GUYANE + FUSION
 # ─────────────────────────────────────────────
 def clip_and_merge(shp_files, contour_guyane):
-    """
-    Pour chaque shapefile MCD64 :
-      - Lit le fichier
-      - Découpe sur le contour de la Guyane
-      - Ajoute les colonnes year / month
-    Fusionne tout en un seul GeoDataFrame.
-    """
     gdfs = []
 
     for item in tqdm(shp_files, desc="Clip + fusion"):
         shp_path = item["shp_path"]
         year     = item["year"]
         month    = item["month"]
-
-        # Fichier clip déjà produit ?
         clip_path = OUT_DIR / f"mcd64_guyane_{year}_{month:02d}.shp"
 
         if clip_path.exists():
@@ -286,29 +260,20 @@ def clip_and_merge(shp_files, contour_guyane):
                 pass
 
         try:
-            # Lire le shapefile MCD64
             gdf = gpd.read_file(shp_path)
-
             if gdf.empty or gdf.geometry.is_empty.all():
                 continue
 
-            # Harmoniser CRS
             gdf = gdf.to_crs("EPSG:4326")
-
-            # Découpe sur Guyane
             gdf_clip = gpd.clip(gdf, contour_guyane)
-
             if gdf_clip.empty:
                 continue
 
-            # Ajouter colonnes temporelles
             gdf_clip["year"]  = year
             gdf_clip["month"] = month
             gdf_clip["period"] = f"{year}-{month:02d}"
 
-            # Sauvegarder le clip mensuel
             gdf_clip.to_file(clip_path)
-
             gdfs.append(gdf_clip)
 
         except Exception as e:
@@ -325,17 +290,14 @@ def clip_and_merge(shp_files, contour_guyane):
         crs="EPSG:4326"
     )
 
-    # Nettoyage colonnes
-    # MCD64 shapefile contient : DN (day of burn), geometry
-    # On renomme pour clarté
-    if "DN" in merged.columns:
-        merged = merged.rename(columns={"DN": "burn_doy"})
+    # Renommage MCD64 : la colonne d'origine peut etre "DN" ou "BurnDate"
+    if "DN" in merged.columns and "BurnDate" not in merged.columns:
+        merged = merged.rename(columns={"DN": "BurnDate"})
 
     # Calculer la surface réelle en ha (en projetant en UTM22N)
-    merged_utm = merged.to_crs("EPSG:2972")   # UTM 22N Guyane
+    merged_utm = merged.to_crs("EPSG:2972")
     merged["area_ha"] = (merged_utm.geometry.area / 10000).round(2)
 
-    # Surface totale
     total_ha = merged["area_ha"].sum()
     print(f"  Surface brûlée totale : {total_ha:,.0f} ha")
     print(f"  Polygones : {len(merged):,}")
@@ -343,20 +305,47 @@ def clip_and_merge(shp_files, contour_guyane):
     return merged
 
 # ─────────────────────────────────────────────
-# 7. EXPORT FINAL
+# 7. EXPORT FINAL (GeoPackage + GeoJSON + SQL)
 # ─────────────────────────────────────────────
 def export_final(gdf, out_dir):
-    """Export GeoPackage + GeoJSON du fichier fusionné."""
+    """Export GeoPackage + GeoJSON + SQL du fichier fusionné."""
 
-    # GeoPackage (recommandé pour QGIS/PostGIS)
+    def safe_write(path, write_fn, label):
+        """
+        Execute une fonction d'ecriture en capturant les PermissionError.
+        Affiche un message clair si le fichier est verrouille par QGIS/editeur.
+        """
+        try:
+            write_fn()
+            size = path.stat().st_size
+            unit = "Mo" if size > 1024 * 1024 else "Ko"
+            val = size / 1024 / 1024 if unit == "Mo" else size / 1024
+            print(f"  OK {path.name}  ({val:.1f} {unit})")
+            return True
+        except PermissionError:
+            print(f"  /!\\ {path.name} est verrouille (ouvert dans QGIS ou un editeur ?)")
+            print(f"      -> Ferme l'application, puis relance le script.")
+            print(f"      -> L'export continue avec les autres fichiers.")
+            return False
+        except Exception as e:
+            print(f"  /!\\ Erreur sur {path.name} : {e}")
+            return False
+
+    # GeoPackage (EPSG:4326, comme avant — utile pour QGIS)
     gpkg_path = out_dir / "mcd64_guyane_complet.gpkg"
-    gdf.to_file(gpkg_path, driver="GPKG", layer="surfaces_brulees")
-    print(f"  OK {gpkg_path.name}  ({gpkg_path.stat().st_size/1024/1024:.1f} Mo)")
+    safe_write(
+        gpkg_path,
+        lambda: gdf.to_file(gpkg_path, driver="GPKG", layer="surfaces_brulees"),
+        "GeoPackage 4326"
+    )
 
-    # GeoJSON (pour dashboard web)
+    # GeoJSON
     geojson_path = out_dir / "mcd64_guyane_complet.geojson"
-    gdf.to_file(geojson_path, driver="GeoJSON")
-    print(f"  OK {geojson_path.name}")
+    safe_write(
+        geojson_path,
+        lambda: gdf.to_file(geojson_path, driver="GeoJSON"),
+        "GeoJSON"
+    )
 
     # CSV résumé par année
     if "year" in gdf.columns and "area_ha" in gdf.columns:
@@ -366,11 +355,129 @@ def export_final(gdf, out_dir):
                      .reset_index()
                      .round({"area_ha_total":1}))
         csv_path = out_dir / "mcd64_guyane_resume_annuel.csv"
-        resume.to_csv(csv_path, index=False)
-        print(f"  OK {csv_path.name}")
-
+        safe_write(
+            csv_path,
+            lambda: resume.to_csv(csv_path, index=False),
+            "CSV resume"
+        )
         print("\n  Résumé annuel :")
         print(resume.to_string(index=False))
+
+    # ═══════════════════════════════════════════════════════
+    # Export GeoPackage en EPSG:2972 + commande ogr2ogr
+    # ═══════════════════════════════════════════════════════
+    export_for_postgis(gdf, out_dir)
+
+
+def export_for_postgis(gdf, out_dir):
+    """
+    Prepare un GeoPackage aligne sur le schema de la table PostGIS
+    (EPSG:2972, MultiPolygon, colonnes BurnDate/year/month/period/area_ha)
+    et genere un script .bat + .sh pour l'import via ogr2ogr.
+    """
+    print("\n  Preparation pour import PostGIS...")
+
+    # Copie pour ne pas modifier le gdf d'origine
+    gdf_pg = gdf.copy()
+
+    # 1. Reprojection vers EPSG:2972
+    if gdf_pg.crs is None or gdf_pg.crs.to_epsg() != SQL_SRID:
+        gdf_pg = gdf_pg.to_crs(f"EPSG:{SQL_SRID}")
+
+    # 2. Conversion en MultiPolygon (contrainte de la table)
+    gdf_pg["geometry"] = gdf_pg.geometry.apply(force_multipolygon)
+    gdf_pg = gdf_pg[gdf_pg.geometry.notna()]
+
+    # 3. Ne garder QUE les colonnes presentes dans la table cible
+    cols_cibles = ["BurnDate", "year", "month", "period", "area_ha", "geometry"]
+    cols_dispo = [c for c in cols_cibles if c in gdf_pg.columns]
+    gdf_pg = gdf_pg[cols_dispo]
+
+    # 4. Ecrire le GeoPackage dedie a l'import PostGIS
+    gpkg_postgis = out_dir / "mcd64_guyane_postgis.gpkg"
+    try:
+        gdf_pg.to_file(gpkg_postgis, driver="GPKG", layer=SQL_TABLE)
+        print(f"  OK {gpkg_postgis.name}  ({gpkg_postgis.stat().st_size/1024/1024:.1f} Mo, EPSG:{SQL_SRID})")
+    except PermissionError:
+        print(f"  /!\\ {gpkg_postgis.name} verrouille (ouvert dans QGIS ?)")
+        print(f"      Ferme QGIS puis relance le script.")
+        return
+    except Exception as e:
+        print(f"  /!\\ Erreur sur {gpkg_postgis.name} : {e}")
+        return
+
+    # 5. Generer les scripts d'import (Windows .bat + Linux/Mac .sh)
+    gpkg_abs = gpkg_postgis.resolve()
+
+    bat_content = f"""@echo off
+REM ============================================================
+REM Import MCD64 Guyane dans PostGIS via ogr2ogr
+REM Table : {SQL_SCHEMA}.{SQL_TABLE}
+REM ============================================================
+
+REM >> ADAPTER ces variables avant lancement <<
+set PGHOST=localhost
+set PGPORT=15432
+set PGUSER=icare
+set PGDATABASE=icare_3.2.3
+REM Le mot de passe sera demande interactivement (ou mettre dans %APPDATA%\\postgresql\\pgpass.conf)
+
+REM (Optionnel) Vider la table avant import complet :
+REM psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %PGDATABASE% -c "TRUNCATE {SQL_SCHEMA}.{SQL_TABLE} RESTART IDENTITY;"
+
+ogr2ogr ^
+  -f PostgreSQL ^
+  PG:"host=%PGHOST% port=%PGPORT% user=%PGUSER% dbname=%PGDATABASE%" ^
+  "{gpkg_abs}" ^
+  -nln {SQL_SCHEMA}.{SQL_TABLE} ^
+  -append ^
+  -lco GEOMETRY_NAME=geom ^
+  -nlt MULTIPOLYGON ^
+  -t_srs EPSG:{SQL_SRID}
+
+echo.
+echo Import termine. Verification :
+psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %PGDATABASE% -c ^
+  "SELECT COUNT(*) AS nb, SUM(area_ha)::numeric(12,2) AS ha, MIN(year) AS y1, MAX(year) AS y2 FROM {SQL_SCHEMA}.{SQL_TABLE};"
+
+pause
+"""
+    bat_path = out_dir / "import_postgis.bat"
+    bat_path.write_text(bat_content, encoding="utf-8")
+    print(f"  OK {bat_path.name}  (Windows)")
+
+    # Version Linux/Mac
+    sh_content = f"""#!/bin/bash
+# ============================================================
+# Import MCD64 Guyane dans PostGIS via ogr2ogr
+# Table : {SQL_SCHEMA}.{SQL_TABLE}
+# ============================================================
+
+PGHOST=localhost
+PGPORT=15432
+PGUSER=icare
+PGDATABASE=icare_3.2.3
+
+# (Optionnel) Vider la table avant import complet :
+# psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE \\
+#   -c "TRUNCATE {SQL_SCHEMA}.{SQL_TABLE} RESTART IDENTITY;"
+
+ogr2ogr \\
+  -f PostgreSQL \\
+  PG:"host=$PGHOST port=$PGPORT user=$PGUSER dbname=$PGDATABASE" \\
+  "{gpkg_abs}" \\
+  -nln {SQL_SCHEMA}.{SQL_TABLE} \\
+  -append \\
+  -lco GEOMETRY_NAME=geom \\
+  -nlt MULTIPOLYGON \\
+  -t_srs EPSG:{SQL_SRID}
+
+psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE \\
+  -c "SELECT COUNT(*), SUM(area_ha)::numeric(12,2), MIN(year), MAX(year) FROM {SQL_SCHEMA}.{SQL_TABLE};"
+"""
+    sh_path = out_dir / "import_postgis.sh"
+    sh_path.write_text(sh_content, encoding="utf-8")
+    print(f"  OK {sh_path.name}  (Linux/Mac)")
 
 # ─────────────────────────────────────────────
 # PIPELINE PRINCIPAL
@@ -384,13 +491,11 @@ def run():
     print("=" * 60)
 
     years = list(range(YEAR_START, YEAR_END + 1))
-    months_filter = MONTHS  # None = tous
+    months_filter = MONTHS
 
-    # 1. Contour Guyane ─────────────────────────────────────
     print("\n>> Contour Guyane...")
     contour = get_contour_guyane()
 
-    # 2. Connexion SFTP ─────────────────────────────────────
     print("\n>> Connexion SFTP...")
     try:
         transport, sftp = connect_sftp()
@@ -400,15 +505,12 @@ def run():
         return
 
     try:
-        # 3. Lister les fichiers ────────────────────────────
         print("\n>> Listage des fichiers disponibles...")
         file_list = list_remote_files(sftp, years, months_filter)
-
         if not file_list:
             print("  Aucun fichier trouvé pour cette plage.")
             return
 
-        # 4. Téléchargement ─────────────────────────────────
         print(f"\n>> Téléchargement ({len(file_list)} fichiers)...")
         downloaded = download_files(sftp, file_list)
 
@@ -421,23 +523,18 @@ def run():
         print("  Aucun fichier téléchargé.")
         return
 
-    # 5. Extraction ─────────────────────────────────────────
     print(f"\n>> Extraction des shapefiles...")
     shp_files = extract_shapefiles(downloaded)
-
     if not shp_files:
         print("  Aucun shapefile extrait.")
         return
 
-    # 6. Clip + Fusion ──────────────────────────────────────
     print(f"\n>> Découpe sur Guyane + fusion...")
     gdf_final = clip_and_merge(shp_files, contour)
-
     if gdf_final.empty:
         print("  Aucun polygone dans l'emprise Guyane.")
         return
 
-    # 7. Export ─────────────────────────────────────────────
     print(f"\n>> Export final...")
     export_final(gdf_final, OUT_DIR)
 
@@ -446,22 +543,25 @@ def run():
     print("=" * 60)
     print(f"\n  Fichiers dans : {OUT_DIR.resolve()}")
     print("\n  Import QGIS :")
-    print("    Glisser mcd64_guyane_complet.gpkg dans QGIS")
-    print("    CRS : EPSG:4326 (WGS84)")
-    print("\n  Import PostGIS :")
-    print("    ogr2ogr -f PostgreSQL PG:'host=... dbname=...' \\")
-    print("      mcd64_guyane_complet.gpkg -nln surfaces_brulees")
-    print("\n  Colonnes disponibles :")
-    print("    burn_doy  : jour julien de la combustion (1-366)")
-    print("    year      : année")
-    print("    month     : mois")
-    print("    period    : YYYY-MM")
-    print("    area_ha   : surface brûlée réelle en hectares (UTM22N)")
-    print("    geometry  : MultiPolygon EPSG:4326")
+    print("    Glisser mcd64_guyane_complet.gpkg dans QGIS (EPSG:4326)")
+    print("\n  Import PostGIS via ogr2ogr :")
+    print(f"    Double-clic sur : {(OUT_DIR / 'import_postgis.bat').resolve()}")
+    print("    (apres avoir adapte les variables PGHOST/PGPORT/PGUSER/PGDATABASE)")
+    print("\n  Ou en ligne de commande :")
+    print(f'    ogr2ogr -f PostgreSQL PG:"host=localhost port=15432 user=icare dbname=icare_3.2.3" \\')
+    print(f'      "{(OUT_DIR / "mcd64_guyane_postgis.gpkg").resolve()}" \\')
+    print(f'      -nln {SQL_SCHEMA}.{SQL_TABLE} -append \\')
+    print(f'      -lco GEOMETRY_NAME=geom -nlt MULTIPOLYGON -t_srs EPSG:{SQL_SRID}')
+    print("\n  Colonnes de la table :")
+    print("    BurnDate (int2)  : jour julien de la combustion (1-366)")
+    print("    year     (int2)  : année")
+    print("    month    (int2)  : mois")
+    print("    period   (varchar): YYYY-MM")
+    print("    area_ha  (numeric): surface en hectares (calculée en UTM22N)")
+    print("    geom (multipolygon, 2972) : géométrie reprojetée en UTM22N")
 
 
 if __name__ == "__main__":
-    # ── Vérification dépendances ──────────────────────────
     missing = []
     for pkg in ["paramiko","geopandas","shapely","pandas","tqdm","requests"]:
         try:
