@@ -3,4 +3,5 @@
 /donnees_meteo_guyane
 readme.md
 .env
+*.sql
 "@ | Out-File -FilePath .gitignore -Encoding utf8"
