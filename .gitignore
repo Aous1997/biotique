@@ -1,3 +1,6 @@
 /data
 /outputs
 /donnees_meteo_guyane
+readme.md
+.env
+"@ | Out-File -FilePath .gitignore -Encoding utf8"

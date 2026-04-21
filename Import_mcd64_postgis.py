@@ -5,15 +5,18 @@ import sys
 import geopandas as gpd
 from sqlalchemy import create_engine, text
 from pathlib import Path
+from dotenv import load_dotenv
 
 # =============================================================
 # CONFIGURATION — A ADAPTER
 # =============================================================
 
-DB_HOST = "localhost"
-DB_PORT = 15432
-DB_USER = "icare"
-DB_NAME = "icare_3.2.3"
+load_dotenv(Path(__file__).parent/".env")
+DB_HOST = os.environ.get("PGHOST","localhost")
+DB_PORT = int(os.environ.get("PGPORT","5432"))
+DB_USER = os.environ.get("PGUSER")
+DB_PASS = os.environ.get("PGPASSWORD")
+DB_NAME = os.environ.get("PGDATABASE")
 
 # Mot de passe : laisse vide ici, le script le demandera,
 # ou mets-le ici, ou utilise la variable d'environnement PGPASSWORD
@@ -53,8 +56,6 @@ def main():
     print("Lecture de {} ...".format(GPKG_PATH))
     gdf = gpd.read_file(GPKG_PATH)
     print("  {:,} polygones, CRS = {}".format(len(gdf), gdf.crs))
-
-    # 4. Verif CRS cible
     if gdf.crs is None or gdf.crs.to_epsg() != 2972:
         print("  Reprojection vers EPSG:2972 ...")
         gdf = gdf.to_crs("EPSG:2972")

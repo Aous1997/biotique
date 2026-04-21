@@ -1,52 +1,71 @@
 """
 =============================================================
- Téléchargement des données météo HORAIRES - GUYANE (973)
- Source : data.gouv.fr / Météo-France (Licence Ouverte Etalab)
- Documentation : https://static.data.gouv.fr/resources/
-   donnees-climatologiques-de-base-horaires/20260401-165114/
-   climatologie-donnees-horaires-descriptif-20260401.pdf
+ Telechargement des donnees meteo HORAIRES - GUYANE (973)
+ Source : data.gouv.fr / Meteo-France (Licence Ouverte Etalab)
 
- OBJECTIF : produire un CSV prêt à être inséré dans la table
-            biotique.biotique_meteo (PostgreSQL).
+ OBJECTIF : telecharger les ressources data.gouv.fr et les
+ enregistrer localement.
 
- Formules :
-   • T_kelvin = T_celsius + 273.15
-   • PAR (µmol/m²/s) = GLO (J/cm²) × 0.454 × (10000/3600) × 2.02
-
- Compatible Python 3.7+ (pas de syntaxe "X | None")
+ Mode de sauvegarde, configurable ci-dessous :
+   - COLONNES_A_GARDER = None    -> CSV complets (toutes colonnes)
+   - COLONNES_A_GARDER = [...]   -> filtre uniquement ces colonnes
 =============================================================
 """
 
 import requests
-import pandas as pd
 import gzip
 import io
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
 
 # =============================================================
-# PARAMÈTRES
+# PARAMETRES
 # =============================================================
 
-# Liste des ressources data.gouv.fr à télécharger (à compléter)
+# Liste des ressources data.gouv.fr a telecharger
 RESOURCE_IDS = [
     "3d95b695-f26f-4f2f-b7f2-689affabb213",
     "a2407432-afc2-4149-b8d7-eee82e6f0442",
 ]
 
-# Métadonnées à écrire dans la table
-NUMREG = "03"          # code région Guyane
-NUMDEP = "973"         # code département Guyane
-SOURCE = "Météo-France (data.gouv.fr)"
-VERSION = datetime.now().strftime("%Y-%m-%d")
-COMMENTAIRES = "Heures en fuseau local (UTC-3). PAR=GLO*0.454*(10000/3600)*2.02. Agregation inter-stations par mediane."
+# FILTRAGE DES COLONNES
+# ---------------------
+# Option 1 - TOUT GARDER (maximum de flexibilite pour le futur) :
+# COLONNES_A_GARDER = None
+#
+# Option 2 - NE GARDER QUE LES COLONNES UTILES (fichiers plus legers) :
+# COLONNES_A_GARDER = [
+#     "NUM_POSTE", "NOM_USUEL",
+#     "LAT", "LON", "ALTI",
+#     "AAAAMMJJHH",
+#     "T",        # Temperature (C)
+#     "GLO",      # Rayonnement global (J/cm2)
+# ]
+#
+# Option 3 - Colonnes utiles + un peu plus (pour analyses elargies) :
+COLONNES_A_GARDER = [
+    # Identification station
+    "NUM_POSTE", "NOM_USUEL", "LAT", "LON", "ALTI",
+    # Date
+    "AAAAMMJJHH",
+    # Variables principales demandees
+    "T",          # Temperature sous abri (C)
+    "GLO",        # Rayonnement global (J/cm2)
+    # Variables complementaires utiles (a commenter si pas besoin)
+    "TD",         # Point de rosee (C)
+    "U",          # Humidite relative (%)
+    "PSTAT",      # Pression station (hPa)
+    "RR1",        # Precipitations horaires (mm)
+    "FF",         # Vent moyen a 10m (m/s)
+    "DD",         # Direction du vent (degres)
+    "INS",        # Insolation horaire (min)
+    "DIR",        # Rayonnement direct (J/cm2)
+    "DIF",        # Rayonnement diffus (J/cm2)
+]
 
-# Coefficient PAR (≈ 2,5474)
-COEF_PAR = 0.454 * (10000 / 3600) * 2.02
-
-DOSSIER_SORTIE = Path("./donnees_meteo_guyane")
-DOSSIER_SORTIE.mkdir(exist_ok=True)
+DOSSIER_SORTIE = Path("./donnees_meteo_guyane/brut")
+DOSSIER_SORTIE.mkdir(parents=True, exist_ok=True)
 
 URL_API = "https://www.data.gouv.fr/api/1/datasets/r/{id}"
 
@@ -54,178 +73,111 @@ URL_API = "https://www.data.gouv.fr/api/1/datasets/r/{id}"
 # =============================================================
 # FONCTIONS
 # =============================================================
-def telecharger_ressource(resource_id):
-    # type: (str) -> Optional[pd.DataFrame]
-    """Télécharge une ressource data.gouv.fr (CSV.gz) -> DataFrame."""
+def telecharger_ressource(resource_id, dossier, colonnes_filtre=None):
+    """
+    Telecharge une ressource data.gouv.fr.
+
+    colonnes_filtre : None  -> garde toutes les colonnes
+                      liste -> ne conserve que les colonnes listees (presentes)
+    """
     url = URL_API.format(id=resource_id)
-    print("[>] Telechargement " + resource_id)
+    print("[>] Telechargement {}".format(resource_id))
+
     try:
         r = requests.get(url, timeout=600, allow_redirects=True)
         r.raise_for_status()
         contenu = r.content
 
-        if contenu[:2] == b"\x1f\x8b":  # gzip
+        # Detection gzip
+        if contenu[:2] == b"\x1f\x8b":
             with gzip.open(io.BytesIO(contenu), "rt", encoding="utf-8") as f:
                 df = pd.read_csv(f, sep=";", low_memory=False)
         else:
             df = pd.read_csv(io.BytesIO(contenu), sep=";",
                              low_memory=False, encoding="utf-8")
 
-        cols_presentes = [c for c in ("T", "GLO", "NUM_POSTE", "AAAAMMJJHH")
-                          if c in df.columns]
-        print("    OK  {:,} lignes  |  colonnes cles : {}".format(
-            len(df), cols_presentes))
-        return df
+        taille_brute_mo = len(contenu) / 1024 / 1024
+        nb_cols_init = len(df.columns)
+
+        # --- FILTRAGE DES COLONNES ------------------------------
+        if colonnes_filtre is not None:
+            cols_gardees = [c for c in colonnes_filtre if c in df.columns]
+            cols_manquantes = [c for c in colonnes_filtre if c not in df.columns]
+
+            if cols_manquantes:
+                print("    Colonnes demandees absentes : {}".format(cols_manquantes))
+
+            if not cols_gardees:
+                print("    ATTENTION : aucune colonne filtree presente dans ce fichier")
+                return None
+
+            df = df[cols_gardees]
+            print("    Filtrage : {} colonnes gardees sur {}".format(
+                len(cols_gardees), nb_cols_init))
+
+        # Nom de fichier (ID + periode si possible)
+        periode = ""
+        if "AAAAMMJJHH" in df.columns and len(df) > 0:
+            try:
+                dmin = str(int(df["AAAAMMJJHH"].min()))[:6]
+                dmax = str(int(df["AAAAMMJJHH"].max()))[:6]
+                periode = "_{}_{}".format(dmin, dmax)
+            except Exception:
+                periode = ""
+
+        fichier_csv = dossier / "meteo_{}{}.csv".format(resource_id[:8], periode)
+        df.to_csv(fichier_csv, sep=";", index=False, encoding="utf-8")
+
+        taille_finale_mo = fichier_csv.stat().st_size / 1024 / 1024
+        print("    OK  {:,} lignes, {} cols | reseau {:.1f} Mo -> disque {:.1f} Mo".format(
+            len(df), len(df.columns), taille_brute_mo, taille_finale_mo))
+
+        return fichier_csv
+
     except Exception as e:
         print("    ERREUR : {}".format(e))
         return None
 
 
-def fusionner(dfs):
-    # type: (List[pd.DataFrame]) -> pd.DataFrame
-    """Concatène puis dédoublonne sur (NUM_POSTE, AAAAMMJJHH)."""
-    df_all = pd.concat(dfs, ignore_index=True, sort=False)
-    if "NUM_POSTE" in df_all.columns and "AAAAMMJJHH" in df_all.columns:
-        df_all = (
-            df_all.sort_values(["NUM_POSTE", "AAAAMMJJHH"])
-            .groupby(["NUM_POSTE", "AAAAMMJJHH"], as_index=False)
-            .first()
-        )
-    return df_all
-
-
 # =============================================================
-# 1. TELECHARGEMENT
+# EXECUTION
 # =============================================================
-print("Telechargement de {} ressource(s) data.gouv.fr\n".format(len(RESOURCE_IDS)))
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  Telechargement donnees meteo Guyane")
+    print("  Date d'execution : {}".format(datetime.now().strftime("%Y-%m-%d %H:%M")))
+    print("  Dossier sortie   : {}".format(DOSSIER_SORTIE.resolve()))
 
-dfs = []
-for rid in RESOURCE_IDS:
-    df = telecharger_ressource(rid)
-    if df is not None:
-        dfs.append(df)
+    if COLONNES_A_GARDER is None:
+        print("  Mode             : COMPLET (toutes colonnes)")
+    else:
+        print("  Mode             : FILTRE ({} colonnes demandees)".format(
+            len(COLONNES_A_GARDER)))
+        print("  Colonnes         : {}".format(", ".join(COLONNES_A_GARDER)))
+    print("=" * 60)
+    print()
 
-if not dfs:
-    raise SystemExit("Aucune donnee telechargee.")
+    fichiers_ok = []
+    for rid in RESOURCE_IDS:
+        chemin = telecharger_ressource(rid, DOSSIER_SORTIE, COLONNES_A_GARDER)
+        if chemin is not None:
+            fichiers_ok.append(chemin)
 
-# =============================================================
-# 2. FUSION
-# =============================================================
-df = fusionner(dfs)
-print("\n[OK] {:,} lignes apres fusion.\n".format(len(df)))
+    # Resume
+    print("\n" + "=" * 60)
+    print("  TERMINE")
+    print("=" * 60)
+    print("  {} / {} fichiers telecharges".format(len(fichiers_ok), len(RESOURCE_IDS)))
 
-# =============================================================
-# 3. CONSTRUCTION DU DATAFRAME AU FORMAT DE LA TABLE CIBLE
-# =============================================================
-for col in ("NUM_POSTE", "AAAAMMJJHH"):
-    if col not in df.columns:
-        raise SystemExit("Colonne '{}' absente des donnees.".format(col))
+    if fichiers_ok:
+        taille_totale = sum(f.stat().st_size for f in fichiers_ok) / 1024 / 1024
+        print("  Taille totale    : {:.1f} Mo".format(taille_totale))
+        print("\n  Fichiers dans {} :".format(DOSSIER_SORTIE))
+        for f in fichiers_ok:
+            taille_mo = f.stat().st_size / 1024 / 1024
+            print("    - {}  ({:.1f} Mo)".format(f.name, taille_mo))
 
-# Horodatage
-date_series = pd.to_datetime(df["AAAAMMJJHH"].astype(str),
-                             format="%Y%m%d%H", errors="coerce")
-
-# Temperature
-t_celsius = pd.to_numeric(df.get("T"), errors="coerce")
-t_kelvin = t_celsius + 273.15
-
-# Rayonnement et PAR
-rg = pd.to_numeric(df.get("GLO"), errors="coerce")
-par = rg * COEF_PAR
-
-# DataFrame final
-out = pd.DataFrame({
-    "numreg":             NUMREG,
-    "numdep":             NUMDEP,
-    "date":               date_series,
-    "t_ambiante_celsius": t_celsius,
-    "t_ambiante_kelvin":  t_kelvin,
-    "rg":                 rg,
-    "unite_rg":           "J/cm²",
-    "par":                par,
-    "unite_par":          "µmol/m²/s",
-    "source":             SOURCE,
-    "version":            VERSION,
-    "commentaires":       COMMENTAIRES,
-})
-
-out = out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
-# =============================================================
-# 4. EXPORT BRUT PAR STATION
-# =============================================================
-fichier_brut = DOSSIER_SORTIE / "biotique_meteo_brut_par_station.csv"
-out_brut = out.assign(num_poste=df["NUM_POSTE"].values)[
-    ["num_poste"] + list(out.columns)
-]
-out_brut.to_csv(fichier_brut, sep=";", index=False, encoding="utf-8")
-print("[FICHIER] Brut par station  : {}  ({:,} lignes)".format(
-    fichier_brut, len(out_brut)))
-
-# =============================================================
-# 4b. EXPORT MOYENNE DEPARTEMENTALE (prêt pour INSERT SQL)
-# =============================================================
-# Agregation par MEDIANE (plus robuste aux valeurs extremes qu'une moyenne)
-# Une station avec un capteur defectueux ou une valeur aberrante ne biaise
-# plus la valeur finale du departement.
-cols_agg = ["t_ambiante_celsius", "t_ambiante_kelvin", "rg", "par"]
-out_dep = out.groupby("date", as_index=False)[cols_agg].median()
-
-out_dep["numreg"] = NUMREG
-out_dep["numdep"] = NUMDEP
-out_dep["unite_rg"] = "J/cm²"
-out_dep["unite_par"] = "µmol/m²/s"
-out_dep["source"] = SOURCE
-out_dep["version"] = VERSION
-out_dep["commentaires"] = COMMENTAIRES
-
-ordre = [
-    "numreg", "numdep", "date",
-    "t_ambiante_celsius", "t_ambiante_kelvin",
-    "rg", "unite_rg",
-    "par", "unite_par",
-    "source", "version", "commentaires",
-]
-out_dep = out_dep[ordre]
-
-fichier_table = DOSSIER_SORTIE / "biotique_meteo.csv"
-out_dep.to_csv(fichier_table, sep=";", index=False, encoding="utf-8",
-               date_format="%Y-%m-%d %H:%M:%S")
-print("[FICHIER] Pret pour INSERT  : {}  ({:,} lignes)".format(
-    fichier_table, len(out_dep)))
-
-# =============================================================
-# 4c. SCRIPT SQL COMPANION
-# =============================================================
-# IMPORTANT : la commande \COPY de psql doit etre sur UNE SEULE LIGNE.
-# On utilise le chemin absolu pour eviter tout probleme de repertoire courant.
-chemin_csv_sql = str(fichier_table.resolve()).replace("\\", "/")
-
-sql = """-- Chargement du CSV dans la table biotique.biotique_meteo
--- Lancement : psql -h HOST -p PORT -U USER -d BASE -f import_postgres.sql
-
-SET client_encoding = 'UTF8';
-
--- (Optionnel) Pour eviter les doublons lors d'un re-import, decommenter :
--- DELETE FROM biotique.biotique_meteo WHERE numdep = '{dep}';
-
-\\COPY biotique.biotique_meteo (numreg, numdep, date, t_ambiante_celsius, t_ambiante_kelvin, rg, unite_rg, par, unite_par, source, version, commentaires) FROM '{chemin}' WITH (FORMAT csv, HEADER true, DELIMITER ';', ENCODING 'UTF8', NULL '');
-
--- Verification
-SELECT COUNT(*) AS nb_lignes, MIN(date) AS date_min, MAX(date) AS date_max FROM biotique.biotique_meteo WHERE numdep = '{dep}';
-""".format(chemin=chemin_csv_sql, dep=NUMDEP)
-(DOSSIER_SORTIE / "import_postgres.sql").write_text(sql, encoding="utf-8")
-print("[FICHIER] Script SQL COPY   : {}".format(DOSSIER_SORTIE / "import_postgres.sql"))
-
-# =============================================================
-# 5. APERCU
-# =============================================================
-print("\nApercu (moyenne departementale, pret pour insertion) :")
-print(out_dep.head(10).to_string(index=False))
-
-print("\nStatistiques :")
-print("   Periode    : {} -> {}".format(out_dep['date'].min(), out_dep['date'].max()))
-print("   T mediane  : {:.2f} C".format(out_dep['t_ambiante_celsius'].median()))
-print("   RG median  : {:.2f} J/cm2".format(out_dep['rg'].median()))
-print("   PAR median : {:.2f} umol/m2/s".format(out_dep['par'].median()))
-print("   Coef PAR   : {:.4f}".format(COEF_PAR))
+        print("\n  Etape suivante :")
+        print("    python traiter_meteo_biotique.py")
+    else:
+        print("\n  Aucun fichier telecharge. Verifie tes IDs et ta connexion.")
