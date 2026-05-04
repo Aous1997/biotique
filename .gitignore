@@ -5,3 +5,5 @@ readme.md
 .env
 *.sql
 "@ | Out-File -FilePath .gitignore -Encoding utf8"
+*.pdf
+*.png
