@@ -6,7 +6,7 @@
  OBJECTIF :
    1. Lire les CSV bruts de ./donnees_meteo_guyane/brut/
    2. Calculer T_kelvin, PAR, agregation par mediane
-   3. Generer biotique_meteo.csv
+   3. Generer biotique_meteo.csv (archivage)
    4. Inserer directement dans PostgreSQL (via .env)
 
  Pre-requis :
@@ -63,10 +63,10 @@ SCHEMA = "biotique"
 TABLE  = "biotique_meteo"
 
 # Mode d'insertion :
-#   "replace" = DELETE du departement avant INSERT (re-import propre)
+#   "replace" = DELETE du departement avant INSERT (re-import propre) [DEFAUT]
 #   "append"  = ajoute aux donnees existantes (peut creer des doublons)
 #   "skip"    = n'insere pas en base (produit seulement les CSV)
-MODE_IMPORT = "skip"
+MODE_IMPORT = "replace"
 
 # Parametres base (lus depuis .env avec valeurs par defaut)
 DB_HOST = os.environ.get("PGHOST",     "localhost")
@@ -153,19 +153,19 @@ def calculer_colonnes_biotique(df):
 
 
 # =============================================================
-# 4. EXPORTS CSV
+# 4. EXPORTS CSV (archivage)
 # =============================================================
 def exporter_csv(out, dossier):
     """Produit 2 CSV : par station + agrege departement."""
 
-    # Par station
+    # Par station (detail)
     f_station = dossier / "biotique_meteo_par_station.csv"
     out.to_csv(f_station, sep=";", index=False, encoding="utf-8",
                date_format="%Y-%m-%d %H:%M:%S")
     print("[FICHIER] Par station   : {}  ({:,} lignes)".format(
         f_station, len(out)))
 
-    # Agrege departement par MEDIANE
+    # Agrege departement par MEDIANE (sera insere en base)
     cols_agg = ["t_ambiante_celsius", "t_ambiante_kelvin", "rg", "par"]
     out_dep = out.groupby("date", as_index=False)[cols_agg].median()
 
@@ -198,17 +198,64 @@ def exporter_csv(out, dossier):
 # =============================================================
 # 5. INSERTION EN BASE POSTGRESQL
 # =============================================================
+def verifier_table(engine, schema, table):
+    """Verifie si la table existe en base."""
+    from sqlalchemy import text
+    sql = text("""
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = :schema AND table_name = :table
+        )
+    """)
+    with engine.connect() as conn:
+        return conn.execute(sql, {"schema": schema, "table": table}).scalar()
+
+
+def afficher_create_table():
+    """Affiche le SQL CREATE TABLE pour aider l'utilisateur."""
+    print("""
+La table {schema}.{table} n'existe pas encore.
+Connecte-toi a la base avec psql ou DBeaver et execute :
+
+    CREATE SCHEMA IF NOT EXISTS {schema};
+
+    CREATE TABLE {schema}.{table} (
+        numreg              text NOT NULL,
+        numdep              text NOT NULL,
+        date                timestamp(6) NOT NULL,
+        t_ambiante_celsius  float8 NULL,
+        t_ambiante_kelvin   float8 NULL,
+        rg                  float8 NULL,
+        unite_rg            text NULL,
+        par                 float8 NULL,
+        unite_par           text NULL,
+        source              text NULL,
+        version             text NULL,
+        commentaires        text NULL
+    );
+
+Puis relance ce script.
+""".format(schema=SCHEMA, table=TABLE))
+
+
 def inserer_en_base(out_dep):
     """Insere directement le DataFrame dans la table PostgreSQL."""
     if MODE_IMPORT == "skip":
         print("\n[SKIP] MODE_IMPORT='skip' : pas d'insertion en base.")
         return
 
+    # Verification du mot de passe
     if not DB_PASS:
         print("\n[ERREUR] Mot de passe manquant (variable PGPASSWORD).")
-        print("         Cree un fichier .env avec PGPASSWORD=... a cote du script.")
+        print("         Verifie ton fichier .env. Format attendu :")
+        print("           PGHOST=localhost")
+        print("           PGPORT=15432")
+        print("           PGUSER=icare")
+        print("           PGDATABASE=icare_3.2.3")
+        print("           PGPASSWORD=ton_mot_de_passe")
         return
 
+    # Verification des dependances
     try:
         from sqlalchemy import create_engine, text
     except ImportError:
@@ -227,6 +274,7 @@ def inserer_en_base(out_dep):
     print("  Mode      : {}".format(MODE_IMPORT))
     print("=" * 60)
 
+    # Test de connexion
     try:
         engine = create_engine(url)
         with engine.connect() as conn:
@@ -234,6 +282,11 @@ def inserer_en_base(out_dep):
             print("Connecte : {}".format(version[:60]))
     except Exception as e:
         print("[ERREUR] Connexion impossible : {}".format(e))
+        return
+
+    # Verification que la table existe
+    if not verifier_table(engine, SCHEMA, TABLE):
+        afficher_create_table()
         return
 
     # Mode replace : supprime les donnees existantes du departement
@@ -247,16 +300,20 @@ def inserer_en_base(out_dep):
 
     # Insertion via pandas.to_sql
     print("Insertion de {:,} lignes ...".format(len(out_dep)))
-    out_dep.to_sql(
-        name=TABLE,
-        con=engine,
-        schema=SCHEMA,
-        if_exists="append",   # la table existe deja
-        index=False,
-        chunksize=1000,
-    )
+    try:
+        out_dep.to_sql(
+            name=TABLE,
+            con=engine,
+            schema=SCHEMA,
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+        )
+    except Exception as e:
+        print("[ERREUR] Insertion echouee : {}".format(e))
+        return
 
-    # Verification
+    # Verification finale
     with engine.connect() as conn:
         stats = conn.execute(text("""
             SELECT COUNT(*) AS nb,
