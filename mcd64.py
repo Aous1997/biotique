@@ -49,8 +49,8 @@ from shapely.geometry import MultiPolygon, Polygon
 # CONFIGURATION - A MODIFIER
 # ---------------------------------------------
 
-YEAR_START = 2010        # Annee de debut
-YEAR_END   = 2023        # Annee de fin (incluse)
+YEAR_START = 2023        # Annee de debut
+YEAR_END   = 2024        # Annee de fin (incluse)
 
 # Mois a telecharger (1=Jan ... 12=Dec)
 # None = tous les mois
@@ -63,7 +63,7 @@ MONTHS = None
 SFTP_HOST = "fuoco.geog.umd.edu"
 SFTP_USER = "fire"
 SFTP_PASS = "burnt"
-SFTP_BASE = "/data/MODIS/C6/MCD64A1/SHP/Win05"
+SFTP_BASE = "/data/MODIS/C61/MCD64A1/SHP/Win05"
 
 # Contour Guyane
 CONTOUR_URL = (

@@ -32,7 +32,7 @@ GPKG_PATH = Path("./outputs/mcd64/mcd64_guyane_postgis.gpkg")
 # Mode :
 #   "replace" = TRUNCATE la table avant import
 #   "append"  = ajoute aux donnees existantes
-MODE = "replace"
+MODE = "append"
 
 
 # =============================================================
